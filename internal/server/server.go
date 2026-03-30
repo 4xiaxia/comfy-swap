@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"comfy-swap/internal/config"
@@ -35,7 +36,13 @@ type App struct {
 	LogManager   *logs.Manager
 	WebFS        embed.FS
 	ProxyFactory func(comfyURL string) *proxy.ComfyProxy
+
+	pluginStatusMu        sync.RWMutex
+	pluginStatusSnapshot  map[string]interface{}
+	pluginStatusUpdatedAt time.Time
 }
+
+const pluginStatusProbeInterval = 10 * time.Second
 
 func New(dataDir string, webFS embed.FS) (*App, error) {
 	settingsPath, workflowsDir := config.ResolveDataPaths(dataDir)
@@ -43,14 +50,22 @@ func New(dataDir string, webFS embed.FS) (*App, error) {
 	if err := config.EnsureDataDir(dataDir); err != nil {
 		return nil, err
 	}
-	return &App{
+	app := &App{
 		DataDir:      dataDir,
 		SettingsPath: settingsPath,
 		Manager:      workflow.NewManager(workflowsDir),
 		LogManager:   logs.NewManager(logsDir),
 		WebFS:        webFS,
 		ProxyFactory: proxy.New,
-	}, nil
+		pluginStatusSnapshot: map[string]interface{}{
+			"status":    "not_configured",
+			"installed": false,
+			"message":   "ComfyUI URL not configured",
+		},
+	}
+
+	app.startPluginStatusProbe()
+	return app, nil
 }
 
 func (a *App) Router() http.Handler {
@@ -507,37 +522,82 @@ func (a *App) handleDownloadPlugin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handlePluginStatus(w http.ResponseWriter, r *http.Request) {
+	// Keep request-time behavior while also supporting background probing.
+	a.refreshPluginStatus(r.Context())
+
+	// Return cached status from background probing.
+	status := a.getPluginStatusSnapshot()
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (a *App) startPluginStatusProbe() {
+	go func() {
+		// Prime once at startup so status is available even before first UI request.
+		a.refreshPluginStatus(context.Background())
+
+		ticker := time.NewTicker(pluginStatusProbeInterval)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			ctx, cancel := context.WithTimeout(context.Background(), pluginStatusProbeInterval)
+			a.refreshPluginStatus(ctx)
+			cancel()
+		}
+	}()
+}
+
+func (a *App) refreshPluginStatus(ctx context.Context) {
+	status := a.probePluginStatus(ctx)
+
+	a.pluginStatusMu.Lock()
+	a.pluginStatusSnapshot = status
+	a.pluginStatusUpdatedAt = time.Now()
+	a.pluginStatusMu.Unlock()
+}
+
+func (a *App) getPluginStatusSnapshot() map[string]interface{} {
+	a.pluginStatusMu.RLock()
+	defer a.pluginStatusMu.RUnlock()
+	return copyStatusMap(a.pluginStatusSnapshot)
+}
+
+func (a *App) probePluginStatus(ctx context.Context) map[string]interface{} {
 	p, err := a.loadProxy()
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]interface{}{
+		return map[string]interface{}{
 			"status":    "not_configured",
 			"installed": false,
 			"message":   "ComfyUI URL not configured",
-		})
-		return
+		}
 	}
 
-	// Get local workflow list to push to plugin
 	workflows := a.getWorkflowInfoList()
-
-	// Check plugin status endpoint (POST with workflow list)
-	ctx := r.Context()
 	statusResp, err := p.GetPluginStatus(ctx, workflows)
 	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]interface{}{
+		return map[string]interface{}{
 			"status":    "not_installed",
 			"installed": false,
 			"message":   "Plugin not detected on ComfyUI",
-		})
-		return
+		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	return map[string]interface{}{
 		"status":        "connected",
 		"installed":     true,
 		"version":       statusResp["version"],
 		"pending_count": statusResp["pending_count"],
-	})
+	}
+}
+
+func copyStatusMap(in map[string]interface{}) map[string]interface{} {
+	if in == nil {
+		return map[string]interface{}{}
+	}
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // getWorkflowInfoList returns minimal workflow info for syncing to plugin
@@ -546,7 +606,7 @@ func (a *App) getWorkflowInfoList() []proxy.WorkflowInfo {
 	if err != nil {
 		return nil
 	}
-	
+
 	result := make([]proxy.WorkflowInfo, 0, len(list))
 	for _, wf := range list {
 		result = append(result, proxy.WorkflowInfo{
